@@ -13,5 +13,5 @@ services:
       - key: FLW_WEBHOOK_HASH
         sync: false
       - key: FRONTEND_URL
-        value: http://localhost:3000
+        value: "*"  # Or your actual frontend URL
     healthCheckPath: /health
