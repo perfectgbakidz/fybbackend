@@ -90,10 +90,12 @@ class FlyerRecord(SQLModel, table=True):
 # =============================================================================
 
 class FlyerInitiateRequest(BaseModel):
+    # Only apply 500-char limit to specific fields, NOT portrait
     model_config = ConfigDict(str_max_length=500)
 
     full_name: str = Field(..., max_length=18)
-    student_portrait: str = Field(..., description="Base64 encoded photo")
+    # Explicitly exempt portrait from any length limit
+    student_portrait: str = Field(..., description="Base64 encoded photo - no length limit")
 
     nickname: str = Field(default="")
     state_of_origin: str = Field(default="")
@@ -126,6 +128,13 @@ class FlyerInitiateRequest(BaseModel):
             raise ValueError("Full name must be max 17 chars + 1 space")
         if v.count(" ") != 1:
             raise ValueError("Must contain exactly one space (FirstName LastName)")
+        return v
+
+    # Override model validator to exempt student_portrait from str_max_length
+    @field_validator("student_portrait", mode="before")
+    @classmethod
+    def allow_unlimited_portrait(cls, v):
+        # Accept any string length for portrait - no validation
         return v
 
 
