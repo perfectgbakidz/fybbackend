@@ -2,21 +2,24 @@
 Digital Flyer Generation System - FastAPI Backend
 Render-Optimized with Full Yearbook Data Model
 Python 3.11 Compatible
+Features: Optional portrait, Webhook fix, Auto-delete pending after 24h,
+          Admin delete endpoint, Admin upload without payment
 """
 
 import os
 import secrets
 import re
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Literal
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, Header, status
+from fastapi import FastAPI, HTTPException, Depends, Header, status, BackgroundTasks
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict, field_validator
-from sqlmodel import SQLModel, Field as SQLField, create_engine, Session, select, Column, Text
+from sqlmodel import SQLModel, Field as SQLField, create_engine, Session, select, Column, Text, delete
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 from sqlalchemy.orm import sessionmaker
@@ -34,6 +37,8 @@ class Settings:
     ADMIN_PASSWORD: str = "nacos_secure_2024"
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
     PORT: int = int(os.getenv("PORT", "8000"))
+    # Auto-delete pending records after X hours (default 24)
+    AUTO_DELETE_PENDING_HOURS: int = int(os.getenv("AUTO_DELETE_PENDING_HOURS", "24"))
 
 
 settings = Settings()
@@ -50,7 +55,8 @@ class FlyerRecord(SQLModel, table=True):
 
     # 1. CORE IDENTITY
     full_name: str = SQLField(max_length=18)
-    student_portrait: str = SQLField(sa_column=Column(Text))
+    # Portrait is OPTIONAL — nullable in database
+    student_portrait: Optional[str] = SQLField(sa_column=Column(Text, nullable=True), default=None)
 
     # 2. PERSONAL & SOCIAL DETAILS
     nickname: str = SQLField(default="")
@@ -94,8 +100,11 @@ class FlyerInitiateRequest(BaseModel):
     model_config = ConfigDict(str_max_length=500)
 
     full_name: str = Field(..., max_length=18)
-    # Explicitly exempt portrait from any length limit
-    student_portrait: str = Field(..., description="Base64 encoded photo - no length limit")
+    # Portrait is OPTIONAL — no longer required, no length limit
+    student_portrait: Optional[str] = Field(
+        default=None,
+        description="Base64 encoded photo - optional, no length limit"
+    )
 
     nickname: str = Field(default="")
     state_of_origin: str = Field(default="")
@@ -134,7 +143,7 @@ class FlyerInitiateRequest(BaseModel):
     @field_validator("student_portrait", mode="before")
     @classmethod
     def allow_unlimited_portrait(cls, v):
-        # Accept any string length for portrait - no validation
+        # Accept any string length for portrait or None — no validation
         return v
 
 
@@ -155,7 +164,7 @@ class FlyerStatusResponse(BaseModel):
 
 class AdminFlyerDetail(BaseModel):
     full_name: str
-    student_portrait: str
+    student_portrait: Optional[str]
     nickname: str
     state_of_origin: str
     birthday: str
@@ -194,6 +203,68 @@ class AdminDashboardResponse(BaseModel):
     married_count: int
     other_relationship_count: int
     flyers: List[AdminFlyerDetail]
+
+
+class DeleteResponse(BaseModel):
+    success: bool
+    message: str
+    deleted_count: int
+
+
+class AdminUploadRequest(BaseModel):
+    """Admin can upload a finalized flyer record without payment."""
+    model_config = ConfigDict(str_max_length=500)
+
+    full_name: str = Field(..., max_length=18)
+    student_portrait: Optional[str] = Field(
+        default=None,
+        description="Base64 encoded photo - optional, no length limit"
+    )
+
+    nickname: str = Field(default="")
+    state_of_origin: str = Field(default="")
+    birthday_month: str = Field(default="")
+    birthday_day: str = Field(default="")
+    relationship_status: str = Field(default="Single")
+    hobby: str = Field(default="")
+    social_handle: str = Field(default="")
+    favorite_word_quote: str = Field(default="", max_length=20)
+    class_crush: str = Field(default="")
+
+    current_level: Literal["", "ND2", "HND2 - SWD", "HND2 - NCC"] = Field(default="")
+    best_level: str = Field(default="")
+    difficult_level: str = Field(default="")
+    best_course: str = Field(default="")
+    worst_course: str = Field(default="")
+    favorite_lecturer: str = Field(default="")
+    post_held: str = Field(default="")
+    career_alternative: str = Field(default="")
+
+    business_skill: str = Field(default="")
+    whats_next: str = Field(default="")
+    best_campus_experience: str = Field(default="")
+
+    @field_validator("full_name")
+    @classmethod
+    def validate_full_name(cls, v):
+        v = re.sub(r"\s+", " ", v).strip()
+        if len(v) > 18:
+            raise ValueError("Full name must be max 17 chars + 1 space")
+        if v.count(" ") != 1:
+            raise ValueError("Must contain exactly one space (FirstName LastName)")
+        return v
+
+    @field_validator("student_portrait", mode="before")
+    @classmethod
+    def allow_unlimited_portrait(cls, v):
+        return v
+
+
+class AdminUploadResponse(BaseModel):
+    success: bool
+    message: str
+    tx_ref: str
+    record: AdminFlyerDetail
 
 
 # =============================================================================
@@ -270,12 +341,47 @@ def generate_payment_link(tx_ref: str) -> str:
 
 
 # =============================================================================
+# AUTO-DELETE PENDING RECORDS (runs every hour)
+# =============================================================================
+
+async def auto_delete_pending_records():
+    """Background task: Delete pending records older than configured hours."""
+    while True:
+        try:
+            async with async_session_maker() as session:
+                cutoff_time = datetime.now(timezone.utc) - timedelta(hours=settings.AUTO_DELETE_PENDING_HOURS)
+
+                statement = select(FlyerRecord).where(
+                    FlyerRecord.payment_status == "pending",
+                    FlyerRecord.created_at < cutoff_time
+                )
+                result = await session.execute(statement)
+                old_pending = result.scalars().all()
+
+                deleted_count = 0
+                for record in old_pending:
+                    await session.delete(record)
+                    deleted_count += 1
+
+                if deleted_count > 0:
+                    await session.commit()
+                    print(f"[AUTO-DELETE] Deleted {deleted_count} pending records older than {settings.AUTO_DELETE_PENDING_HOURS}h")
+        except Exception as e:
+            print(f"[AUTO-DELETE] Error: {e}")
+
+        # Run every hour
+        await asyncio.sleep(3600)
+
+
+# =============================================================================
 # FASTAPI APP - FIXED CORS
 # =============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    # Start background auto-delete task
+    asyncio.create_task(auto_delete_pending_records())
     yield
     await engine.dispose()
 
@@ -283,7 +389,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="NACOS Digital Flyer API",
     description="Yearbook flyer generation system for MAPOLY students",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan
 )
 
@@ -318,6 +424,7 @@ async def initiate_flyer(
 
         flyer = FlyerRecord(
             full_name=request.full_name,
+            # Use provided portrait or default to None (nullable)
             student_portrait=request.student_portrait,
             nickname=request.nickname,
             state_of_origin=request.state_of_origin,
@@ -375,6 +482,11 @@ async def flutterwave_webhook(
     session: AsyncSession = Depends(get_session)
 ):
     """Handle Flutterwave payment confirmation."""
+    # DEBUG LOGGING — check Render logs to verify
+    print(f"[WEBHOOK] Received verif-hash: '{verif_hash}'")
+    print(f"[WEBHOOK] Expected hash: '{settings.FLW_WEBHOOK_HASH}'")
+    print(f"[WEBHOOK] Match: {secrets.compare_digest(verif_hash or '', settings.FLW_WEBHOOK_HASH)}")
+
     if not verify_webhook_signature(verif_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid webhook signature")
 
@@ -439,6 +551,10 @@ async def check_status(
         created_at=flyer.created_at
     )
 
+
+# =============================================================================
+# ADMIN ENDPOINTS
+# =============================================================================
 
 @app.get(
     "/admin/dashboard",
@@ -521,6 +637,172 @@ async def admin_dashboard(
         raise HTTPException(status_code=500, detail=f"Dashboard error: {str(e)}")
 
 
+@app.delete(
+    "/admin/flyers/{tx_ref}",
+    response_model=DeleteResponse,
+    tags=["Admin"],
+    dependencies=[Depends(verify_admin_credentials)]
+)
+async def admin_delete_flyer(
+    tx_ref: str,
+    session: AsyncSession = Depends(get_session),
+    auth: bool = Depends(verify_admin_credentials)
+):
+    """Admin: Delete a specific flyer record by tx_ref. Protected by HTTP Basic Auth."""
+    try:
+        statement = select(FlyerRecord).where(FlyerRecord.tx_ref == tx_ref)
+        result = await session.execute(statement)
+        flyer = result.scalar_one_or_none()
+
+        if not flyer:
+            raise HTTPException(status_code=404, detail=f"No record found: {tx_ref}")
+
+        await session.delete(flyer)
+        await session.commit()
+
+        return DeleteResponse(
+            success=True,
+            message=f"Record {tx_ref} deleted successfully",
+            deleted_count=1
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        await session.rollback()
+        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
+
+
+@app.delete(
+    "/admin/flyers/bulk/pending",
+    response_model=DeleteResponse,
+    tags=["Admin"],
+    dependencies=[Depends(verify_admin_credentials)]
+)
+async def admin_delete_all_pending(
+    session: AsyncSession = Depends(get_session),
+    auth: bool = Depends(verify_admin_credentials)
+):
+    """Admin: Delete ALL pending records. Protected by HTTP Basic Auth."""
+    try:
+        statement = select(FlyerRecord).where(FlyerRecord.payment_status == "pending")
+        result = await session.execute(statement)
+        pending_flyers = result.scalars().all()
+
+        deleted_count = 0
+        for flyer in pending_flyers:
+            await session.delete(flyer)
+            deleted_count += 1
+
+        await session.commit()
+
+        return DeleteResponse(
+            success=True,
+            message=f"Deleted {deleted_count} pending records",
+            deleted_count=deleted_count
+        )
+
+    except Exception as e:
+        await session.rollback()
+        raise HTTPException(status_code=500, detail=f"Bulk delete failed: {str(e)}")
+
+
+@app.post(
+    "/admin/flyers/upload",
+    response_model=AdminUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Admin"],
+    dependencies=[Depends(verify_admin_credentials)]
+)
+async def admin_upload_flyer(
+    request: AdminUploadRequest,
+    session: AsyncSession = Depends(get_session),
+    auth: bool = Depends(verify_admin_credentials)
+):
+    """Admin: Upload a finalized flyer record WITHOUT requiring payment.
+
+    This bypasses the payment flow entirely. The record is created with
+    payment_status='successful' and amount=0.0.
+    """
+    try:
+        tx_ref = generate_tx_ref()
+
+        flyer = FlyerRecord(
+            full_name=request.full_name,
+            student_portrait=request.student_portrait,
+            nickname=request.nickname,
+            state_of_origin=request.state_of_origin,
+            birthday_month=request.birthday_month,
+            birthday_day=request.birthday_day,
+            relationship_status=request.relationship_status,
+            hobby=request.hobby,
+            social_handle=request.social_handle,
+            favorite_word_quote=request.favorite_word_quote,
+            class_crush=request.class_crush,
+            current_level=request.current_level,
+            best_level=request.best_level,
+            difficult_level=request.difficult_level,
+            best_course=request.best_course,
+            worst_course=request.worst_course,
+            favorite_lecturer=request.favorite_lecturer,
+            post_held=request.post_held,
+            career_alternative=request.career_alternative,
+            business_skill=request.business_skill,
+            whats_next=request.whats_next,
+            best_campus_experience=request.best_campus_experience,
+            tx_ref=tx_ref,
+            payment_status="successful",  # Bypass payment
+            amount=0.0,                   # No payment required
+            created_at=datetime.now(timezone.utc)
+        )
+
+        session.add(flyer)
+        await session.commit()
+        await session.refresh(flyer)
+
+        birthday = f"{flyer.birthday_month} {flyer.birthday_day}".strip() if flyer.birthday_month or flyer.birthday_day else "Not specified"
+
+        return AdminUploadResponse(
+            success=True,
+            message="Admin upload successful. No payment required.",
+            tx_ref=tx_ref,
+            record=AdminFlyerDetail(
+                full_name=flyer.full_name,
+                student_portrait=flyer.student_portrait,
+                nickname=flyer.nickname,
+                state_of_origin=flyer.state_of_origin,
+                birthday=birthday,
+                relationship_status=flyer.relationship_status,
+                hobby=flyer.hobby,
+                social_handle=flyer.social_handle,
+                favorite_word_quote=flyer.favorite_word_quote,
+                class_crush=flyer.class_crush,
+                current_level=flyer.current_level,
+                best_level=flyer.best_level,
+                difficult_level=flyer.difficult_level,
+                best_course=flyer.best_course,
+                worst_course=flyer.worst_course,
+                favorite_lecturer=flyer.favorite_lecturer,
+                post_held=flyer.post_held,
+                career_alternative=flyer.career_alternative,
+                business_skill=flyer.business_skill,
+                whats_next=flyer.whats_next,
+                best_campus_experience=flyer.best_campus_experience,
+                tx_ref=flyer.tx_ref,
+                payment_status=flyer.payment_status,
+                amount=flyer.amount,
+                created_at=flyer.created_at.isoformat()
+            )
+        )
+
+    except Exception as e:
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Admin upload failed: {str(e)}"
+        )
+
+
 @app.get("/health", tags=["System"])
 async def health_check(session: AsyncSession = Depends(get_session)):
     try:
@@ -529,6 +811,7 @@ async def health_check(session: AsyncSession = Depends(get_session)):
         return {
             "status": "healthy",
             "database": "connected",
+            "auto_delete_pending_hours": settings.AUTO_DELETE_PENDING_HOURS,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
     except Exception as e:
@@ -539,12 +822,20 @@ async def health_check(session: AsyncSession = Depends(get_session)):
 async def root():
     return {
         "name": "NACOS Digital Flyer API",
-        "version": "2.0.0",
+        "version": "3.0.0",
+        "features": [
+            "Auto-delete pending records after 24h",
+            "Admin bulk delete",
+            "Admin upload without payment"
+        ],
         "endpoints": {
             "initiate": "POST /api/flyers/initiate",
             "webhook": "POST /api/webhook/flutterwave",
             "status": "GET /api/flyers/status/{tx_ref}",
-            "admin": "GET /admin/dashboard (Basic Auth: admin_nacos / nacos_secure_2024)"
+            "admin_dashboard": "GET /admin/dashboard (Basic Auth)",
+            "admin_delete_one": "DELETE /admin/flyers/{tx_ref} (Basic Auth)",
+            "admin_delete_pending": "DELETE /admin/flyers/bulk/pending (Basic Auth)",
+            "admin_upload": "POST /admin/flyers/upload (Basic Auth)"
         }
     }
 
