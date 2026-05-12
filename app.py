@@ -16,7 +16,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict, field_validator
-from sqlmodel import SQLModel, Field as SQLField, create_engine, Session, select
+from sqlmodel import SQLModel, Field as SQLField, create_engine, Session, select, Column, Text
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 from sqlalchemy.orm import sessionmaker
@@ -50,7 +50,7 @@ class FlyerRecord(SQLModel, table=True):
 
     # 1. CORE IDENTITY
     full_name: str = SQLField(max_length=18)
-    student_portrait: str = SQLField(sa_column_kwargs={"type_": "TEXT"})
+    student_portrait: str = SQLField(sa_column=Column(Text))  # FIXED: Use sa_column instead of sa_column_kwargs
 
     # 2. PERSONAL & SOCIAL DETAILS
     nickname: str = SQLField(default="")
@@ -76,7 +76,7 @@ class FlyerRecord(SQLModel, table=True):
     # 4. FUTURE & PROFESSIONAL
     business_skill: str = SQLField(default="")
     whats_next: str = SQLField(default="")
-    best_campus_experience: str = SQLField(sa_column_kwargs={"type_": "TEXT"}, default="")
+    best_campus_experience: str = SQLField(sa_column=Column(Text), default="")  # FIXED
 
     # PAYMENT & SYSTEM
     tx_ref: str = SQLField(unique=True, index=True)
