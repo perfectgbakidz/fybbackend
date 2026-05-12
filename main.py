@@ -29,10 +29,10 @@ from sqlalchemy.orm import sessionmaker
 class Settings:
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./flyers.db")
     FLW_SECRET_KEY: str = os.getenv("FLW_SECRET_KEY", "")
-    FLW_WEBHOOK_HASH: str = os.getenv("FLW_WEBHOOK_HASH", "")
+    FLW_WEBHOOK_HASH: str = os.getenv("k*JU9ktmeqtqCtW", "")
     ADMIN_USERNAME: str = "admin_nacos"
     ADMIN_PASSWORD: str = "nacos_secure_2024"
-    FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000","https://nacosfyb-lake.vercel.app")
     PORT: int = int(os.getenv("PORT", "8000"))
 
 
@@ -50,7 +50,7 @@ class FlyerRecord(SQLModel, table=True):
 
     # 1. CORE IDENTITY
     full_name: str = SQLField(max_length=18)
-    student_portrait: str = SQLField(sa_column=Column(Text))  # FIXED: Use sa_column instead of sa_column_kwargs
+    student_portrait: str = SQLField(sa_column=Column(Text))
 
     # 2. PERSONAL & SOCIAL DETAILS
     nickname: str = SQLField(default="")
@@ -76,7 +76,7 @@ class FlyerRecord(SQLModel, table=True):
     # 4. FUTURE & PROFESSIONAL
     business_skill: str = SQLField(default="")
     whats_next: str = SQLField(default="")
-    best_campus_experience: str = SQLField(sa_column=Column(Text), default="")  # FIXED
+    best_campus_experience: str = SQLField(sa_column=Column(Text), default="")
 
     # PAYMENT & SYSTEM
     tx_ref: str = SQLField(unique=True, index=True)
@@ -188,7 +188,7 @@ class AdminDashboardResponse(BaseModel):
 
 
 # =============================================================================
-# DATABASE SETUP
+# DATABASE SETUP - FIXED WITH checkfirst=True
 # =============================================================================
 
 engine: AsyncEngine = create_async_engine(settings.DATABASE_URL, echo=False, future=True)
@@ -196,8 +196,9 @@ async_session_maker = sessionmaker(engine, class_=AsyncSession, expire_on_commit
 
 
 async def init_db():
+    """Initialize database tables safely - won't crash if tables already exist."""
     async with engine.begin() as conn:
-        await conn.run_sync(SQLModel.metadata.create_all)
+        await conn.run_sync(SQLModel.metadata.create_all, checkfirst=True)
 
 
 async def get_session() -> AsyncSession:
@@ -260,7 +261,7 @@ def generate_payment_link(tx_ref: str) -> str:
 
 
 # =============================================================================
-# FASTAPI APP
+# FASTAPI APP - FIXED CORS
 # =============================================================================
 
 @asynccontextmanager
@@ -277,13 +278,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# FIXED CORS: Allow all origins for now, restrict in production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        settings.FRONTEND_URL,
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=["*"],  # Allow all origins - change to specific URLs in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
