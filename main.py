@@ -29,7 +29,7 @@ from sqlalchemy.orm import sessionmaker
 class Settings:
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./flyers.db")
     FLW_SECRET_KEY: str = os.getenv("FLW_SECRET_KEY", "")
-    FLW_WEBHOOK_HASH: str = os.getenv("k*JU9ktmeqtqCtW", "")
+    FLW_WEBHOOK_HASH: str = os.getenv("FLW_WEBHOOK_HASH", "k*JU9ktmeqtqCtW")
     ADMIN_USERNAME: str = "admin_nacos"
     ADMIN_PASSWORD: str = "nacos_secure_2024"
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
