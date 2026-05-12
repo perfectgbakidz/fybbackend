@@ -32,7 +32,7 @@ class Settings:
     FLW_WEBHOOK_HASH: str = os.getenv("k*JU9ktmeqtqCtW", "")
     ADMIN_USERNAME: str = "admin_nacos"
     ADMIN_PASSWORD: str = "nacos_secure_2024"
-    FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000","https://nacosfyb-lake.vercel.app")
+    FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
     PORT: int = int(os.getenv("PORT", "8000"))
 
 
