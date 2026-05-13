@@ -7,3 +7,4 @@ pydantic-core==2.27.2
 python-multipart==0.0.20
 python-dotenv==1.0.1
 gunicorn==23.0.0
+httpx>=0.24.0
