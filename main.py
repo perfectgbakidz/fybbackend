@@ -29,7 +29,7 @@ from sqlalchemy.orm import sessionmaker
 # =============================================================================
 
 class Settings:
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./flyers.db")
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./fyb.db")
     FLW_SECRET_KEY: str = os.getenv("FLW_SECRET_KEY", "")
     # CRITICAL FIX #1: No hardcoded fallback - MUST be set via environment
     FLW_WEBHOOK_HASH: str = os.getenv("FLW_WEBHOOK_HASH", "")
