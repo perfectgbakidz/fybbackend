@@ -496,24 +496,41 @@ async def flutterwave_webhook(
     print(f"[WEBHOOK] Signature valid")
 
     try:
+        # ─── FIX: Handle BOTH payload formats ───
+        # Format 1: Nested {event, data: {...}}
+        # Format 2: Flat payload (what Flutterwave actually sends)
+        
         event = payload.get("event", "")
         data = payload.get("data", {})
         
-        print(f"[WEBHOOK] Event type: '{event}'")
+        # If no nested data, treat the entire payload as flat data
+        is_flat_format = not data and payload.get("txRef")
+        
+        if is_flat_format:
+            print(f"[WEBHOOK] Detected FLAT payload format")
+            data = payload  # The entire payload IS the data
+            event = payload.get("event.type", "")  # Flutterwave uses 'event.type' in flat format
+            print(f"[WEBHOOK] event.type from flat payload: '{event}'")
+        else:
+            print(f"[WEBHOOK] Detected NESTED payload format")
+            print(f"[WEBHOOK] Event type: '{event}'")
+            
         print(f"[WEBHOOK] Data keys: {list(data.keys())}")
 
         # ─── FIX: Accept multiple event types ───
-        valid_events = ["charge.completed", "charge.successful", "payment.successful"]
-        if event not in valid_events:
+        valid_events = ["charge.completed", "charge.successful", "payment.successful", 
+                       "BANK_TRANSFER_TRANSACTION", "CARD_TRANSACTION", "MOBILE_MONEY_TRANSACTION"]
+        if event not in valid_events and not is_flat_format:
             print(f"[WEBHOOK] Ignoring event: {event}")
             return {"status": "ignored", "message": f"Event {event} not processed"}
 
         payment_status = data.get("status", "").lower()
         print(f"[WEBHOOK] Payment status from payload: '{payment_status}'")
 
-        # ─── Extract tx_ref from multiple locations ───
-        tx_ref = data.get("tx_ref")
-        source = "data.tx_ref"
+        # ─── FIX: Extract tx_ref from both formats ───
+        # Flat format uses 'txRef', nested uses 'tx_ref'
+        tx_ref = data.get("tx_ref") or data.get("txRef")
+        source = "data.tx_ref" if data.get("tx_ref") else "data.txRef"
         
         if not tx_ref:
             meta = data.get("meta", {}) or {}
@@ -521,7 +538,7 @@ async def flutterwave_webhook(
             source = "meta.transaction_id"
             print(f"[WEBHOOK] tx_ref from meta: {tx_ref}")
         else:
-            print(f"[WEBHOOK] tx_ref from data: {tx_ref}")
+            print(f"[WEBHOOK] tx_ref from {source}: {tx_ref}")
 
         if not tx_ref:
             print(f"[WEBHOOK] No tx_ref found anywhere in payload")
