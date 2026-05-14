@@ -1,19 +1,20 @@
 """
 Digital Flyer Generation System - FastAPI Backend
-CORRECTED VERSION with Flutterwave API verification, charge.failed handling,
-and transaction_id tracking.
+Render-Optimized with Full Yearbook Data Model
+Python 3.11 Compatible
+Features: Optional portrait, Webhook fix, Auto-delete pending after 24h,
+          Admin delete endpoint, Admin upload without payment
 """
 
 import os
 import secrets
 import re
 import asyncio
-import httpx  # For async HTTP requests to Flutterwave API
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Literal
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, Header, status, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Depends, Header, status, BackgroundTasks
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -29,30 +30,22 @@ from sqlalchemy.orm import sessionmaker
 # =============================================================================
 
 class Settings:
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./fyb.db")
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./flyers.db")
     FLW_SECRET_KEY: str = os.getenv("FLW_SECRET_KEY", "")
-    # CRITICAL FIX #1: No hardcoded fallback - MUST be set via environment
-    FLW_WEBHOOK_HASH: str = os.getenv("FLW_WEBHOOK_HASH", "")
+    FLW_WEBHOOK_HASH: str = os.getenv("FLW_WEBHOOK_HASH", "k*JU9ktmeqtqCtW")
     ADMIN_USERNAME: str = "admin_nacos"
     ADMIN_PASSWORD: str = "nacos_secure_2024"
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
     PORT: int = int(os.getenv("PORT", "8000"))
+    # Auto-delete pending records after X hours (default 24)
     AUTO_DELETE_PENDING_HOURS: int = int(os.getenv("AUTO_DELETE_PENDING_HOURS", "24"))
-
-    # Validate critical secrets at startup
-    @classmethod
-    def validate(cls):
-        if not cls.FLW_WEBHOOK_HASH:
-            raise RuntimeError("FLW_WEBHOOK_HASH must be set in environment variables")
-        if not cls.FLW_SECRET_KEY:
-            raise RuntimeError("FLW_SECRET_KEY must be set in environment variables")
 
 
 settings = Settings()
 
 
 # =============================================================================
-# DATABASE MODEL - FULL YEARBOOK SCHEMA (FIXED with transaction_id)
+# DATABASE MODEL - FULL YEARBOOK SCHEMA
 # =============================================================================
 
 class FlyerRecord(SQLModel, table=True):
@@ -62,6 +55,7 @@ class FlyerRecord(SQLModel, table=True):
 
     # 1. CORE IDENTITY
     full_name: str = SQLField(max_length=18)
+    # Portrait is OPTIONAL — nullable in database
     student_portrait: Optional[str] = SQLField(sa_column=Column(Text, nullable=True), default=None)
 
     # 2. PERSONAL & SOCIAL DETAILS
@@ -90,28 +84,11 @@ class FlyerRecord(SQLModel, table=True):
     whats_next: str = SQLField(default="")
     best_campus_experience: str = SQLField(sa_column=Column(Text), default="")
 
-    # PAYMENT & SYSTEM (FIXED: Added transaction_id)
+    # PAYMENT & SYSTEM
     tx_ref: str = SQLField(unique=True, index=True)
-    transaction_id: Optional[int] = SQLField(default=None, index=True)  # Flutterwave transaction ID
     payment_status: str = SQLField(default="pending")
     amount: float = SQLField(default=500.0)
-    currency: str = SQLField(default="NGN")
     created_at: datetime = SQLField(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: Optional[datetime] = SQLField(default=None)
-
-
-# NEW: Webhook event log for idempotency and audit trail
-class WebhookLog(SQLModel, table=True):
-    __tablename__ = "webhook_logs"
-
-    id: Optional[int] = SQLField(default=None, primary_key=True)
-    flutterwave_event_id: int = SQLField(index=True)  # The unique 'id' from Flutterwave webhook
-    event_type: str = SQLField()
-    tx_ref: str = SQLField(index=True)
-    transaction_id: Optional[int] = SQLField()
-    status: str = SQLField()
-    payload_summary: str = SQLField(sa_column=Column(Text), default="")
-    processed_at: datetime = SQLField(default_factory=lambda: datetime.now(timezone.utc))
 
 
 # =============================================================================
@@ -119,10 +96,16 @@ class WebhookLog(SQLModel, table=True):
 # =============================================================================
 
 class FlyerInitiateRequest(BaseModel):
+    # Only apply 500-char limit to specific fields, NOT portrait
     model_config = ConfigDict(str_max_length=500)
 
     full_name: str = Field(..., max_length=18)
-    student_portrait: Optional[str] = Field(default=None, description="Base64 encoded photo - optional")
+    # Portrait is OPTIONAL — no longer required, no length limit
+    student_portrait: Optional[str] = Field(
+        default=None,
+        description="Base64 encoded photo - optional, no length limit"
+    )
+
     nickname: str = Field(default="")
     state_of_origin: str = Field(default="")
     birthday_month: str = Field(default="")
@@ -132,6 +115,7 @@ class FlyerInitiateRequest(BaseModel):
     social_handle: str = Field(default="")
     favorite_word_quote: str = Field(default="", max_length=20)
     class_crush: str = Field(default="")
+
     current_level: Literal["", "ND2", "HND2 - SWD", "HND2 - NCC"] = Field(default="")
     best_level: str = Field(default="")
     difficult_level: str = Field(default="")
@@ -140,6 +124,7 @@ class FlyerInitiateRequest(BaseModel):
     favorite_lecturer: str = Field(default="")
     post_held: str = Field(default="")
     career_alternative: str = Field(default="")
+
     business_skill: str = Field(default="")
     whats_next: str = Field(default="")
     best_campus_experience: str = Field(default="")
@@ -154,9 +139,11 @@ class FlyerInitiateRequest(BaseModel):
             raise ValueError("Must contain exactly one space (FirstName LastName)")
         return v
 
+    # Override model validator to exempt student_portrait from str_max_length
     @field_validator("student_portrait", mode="before")
     @classmethod
     def allow_unlimited_portrait(cls, v):
+        # Accept any string length for portrait or None — no validation
         return v
 
 
@@ -198,7 +185,6 @@ class AdminFlyerDetail(BaseModel):
     whats_next: str
     best_campus_experience: str
     tx_ref: str
-    transaction_id: Optional[int]
     payment_status: str
     amount: float
     created_at: str
@@ -226,9 +212,15 @@ class DeleteResponse(BaseModel):
 
 
 class AdminUploadRequest(BaseModel):
+    """Admin can upload a finalized flyer record without payment."""
     model_config = ConfigDict(str_max_length=500)
+
     full_name: str = Field(..., max_length=18)
-    student_portrait: Optional[str] = Field(default=None)
+    student_portrait: Optional[str] = Field(
+        default=None,
+        description="Base64 encoded photo - optional, no length limit"
+    )
+
     nickname: str = Field(default="")
     state_of_origin: str = Field(default="")
     birthday_month: str = Field(default="")
@@ -238,6 +230,7 @@ class AdminUploadRequest(BaseModel):
     social_handle: str = Field(default="")
     favorite_word_quote: str = Field(default="", max_length=20)
     class_crush: str = Field(default="")
+
     current_level: Literal["", "ND2", "HND2 - SWD", "HND2 - NCC"] = Field(default="")
     best_level: str = Field(default="")
     difficult_level: str = Field(default="")
@@ -246,6 +239,7 @@ class AdminUploadRequest(BaseModel):
     favorite_lecturer: str = Field(default="")
     post_held: str = Field(default="")
     career_alternative: str = Field(default="")
+
     business_skill: str = Field(default="")
     whats_next: str = Field(default="")
     best_campus_experience: str = Field(default="")
@@ -274,7 +268,7 @@ class AdminUploadResponse(BaseModel):
 
 
 # =============================================================================
-# DATABASE SETUP
+# DATABASE SETUP - FIXED WITH checkfirst=True
 # =============================================================================
 
 engine: AsyncEngine = create_async_engine(settings.DATABASE_URL, echo=False, future=True)
@@ -282,6 +276,7 @@ async_session_maker = sessionmaker(engine, class_=AsyncSession, expire_on_commit
 
 
 async def init_db():
+    """Initialize database tables safely - won't crash if tables already exist."""
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all, checkfirst=True)
 
@@ -332,50 +327,6 @@ def verify_webhook_signature(verif_hash: Optional[str]) -> bool:
 
 
 # =============================================================================
-# FLUTTERWAVE API VERIFICATION (CRITICAL FIX #2)
-# =============================================================================
-
-async def verify_transaction_with_flutterwave(transaction_id: int) -> dict:
-    """
-    Verify a transaction with Flutterwave API.
-    Returns the verification response or raises HTTPException on failure.
-    """
-    if not settings.FLW_SECRET_KEY:
-        raise HTTPException(status_code=500, detail="FLW_SECRET_KEY not configured")
-
-    url = f"https://api.flutterwave.com/v3/transactions/{transaction_id}/verify"
-    headers = {
-        "Authorization": f"Bearer {settings.FLW_SECRET_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-
-            if data.get("status") != "success":
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"Flutterwave verification failed: {data.get('message', 'Unknown error')}"
-                )
-
-            return data.get("data", {})
-
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Flutterwave API error: {e.response.status_code}"
-            )
-        except httpx.RequestError as e:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Could not reach Flutterwave API: {str(e)}"
-            )
-
-
-# =============================================================================
 # UTILITIES
 # =============================================================================
 
@@ -390,10 +341,11 @@ def generate_payment_link(tx_ref: str) -> str:
 
 
 # =============================================================================
-# AUTO-DELETE PENDING RECORDS
+# AUTO-DELETE PENDING RECORDS (runs every hour)
 # =============================================================================
 
 async def auto_delete_pending_records():
+    """Background task: Delete pending records older than configured hours."""
     while True:
         try:
             async with async_session_maker() as session:
@@ -417,17 +369,18 @@ async def auto_delete_pending_records():
         except Exception as e:
             print(f"[AUTO-DELETE] Error: {e}")
 
+        # Run every hour
         await asyncio.sleep(3600)
 
 
 # =============================================================================
-# FASTAPI APP
+# FASTAPI APP - FIXED CORS
 # =============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    settings.validate()  # Validate secrets at startup
     await init_db()
+    # Start background auto-delete task
     asyncio.create_task(auto_delete_pending_records())
     yield
     await engine.dispose()
@@ -436,20 +389,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="NACOS Digital Flyer API",
     description="Yearbook flyer generation system for MAPOLY students",
-    version="3.1.0",  # Bumped for security fixes
+    version="3.0.0",
     lifespan=lifespan
 )
 
-# FIXED CORS: Restrict to specific origins in production
-allowed_origins = [settings.FRONTEND_URL]
-if settings.FRONTEND_URL == "http://localhost:3000":
-    allowed_origins.append("http://localhost:3000")
-
+# FIXED CORS: Allow all origins for now, restrict in production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=["*"],  # Allow all origins - change to specific URLs in production
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"]
 )
@@ -475,6 +424,7 @@ async def initiate_flyer(
 
         flyer = FlyerRecord(
             full_name=request.full_name,
+            # Use provided portrait or default to None (nullable)
             student_portrait=request.student_portrait,
             nickname=request.nickname,
             state_of_origin=request.state_of_origin,
@@ -497,10 +447,8 @@ async def initiate_flyer(
             whats_next=request.whats_next,
             best_campus_experience=request.best_campus_experience,
             tx_ref=tx_ref,
-            transaction_id=None,
             payment_status="pending",
             amount=500.0,
-            currency="NGN",
             created_at=datetime.now(timezone.utc)
         )
 
@@ -523,10 +471,6 @@ async def initiate_flyer(
         )
 
 
-# =============================================================================
-# FIXED WEBHOOK ENDPOINT
-# =============================================================================
-
 @app.post(
     "/api/webhook/flutterwave",
     status_code=status.HTTP_200_OK,
@@ -537,51 +481,28 @@ async def flutterwave_webhook(
     verif_hash: Optional[str] = Header(None, alias="verif-hash"),
     session: AsyncSession = Depends(get_session)
 ):
-    """
-    Handle Flutterwave payment webhooks with full verification.
+    """Handle Flutterwave payment confirmation."""
+    # DEBUG LOGGING — check Render logs to verify
+    print(f"[WEBHOOK] Received verif-hash: '{verif_hash}'")
+    print(f"[WEBHOOK] Expected hash: '{settings.FLW_WEBHOOK_HASH}'")
+    print(f"[WEBHOOK] Match: {secrets.compare_digest(verif_hash or '', settings.FLW_WEBHOOK_HASH)}")
 
-    CRITICAL FIXES APPLIED:
-    1. No debug logging of secrets
-    2. API verification before updating payment status
-    3. Idempotency check using webhook event ID
-    4. Handles both charge.completed and charge.failed
-    5. Stores transaction_id for audit trail
-    """
-
-    # Verify webhook signature (no debug logging of secrets)
     if not verify_webhook_signature(verif_hash):
-        # Log security event without exposing secrets
-        print(f"[WEBHOOK] Invalid signature received at {datetime.now(timezone.utc).isoformat()}")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid webhook signature")
 
     try:
         event = payload.get("event", "")
         data = payload.get("data", {})
 
-        # Extract Flutterwave's unique event ID for idempotency
-        flutterwave_event_id = data.get("id")
+        if event != "charge.completed":
+            return {"status": "ignored", "message": f"Event {event} not processed"}
+
+        payment_status = data.get("status", "").lower()
         tx_ref = data.get("tx_ref")
-        transaction_id = data.get("id")  # This is the Flutterwave transaction ID
 
-        # Log webhook receipt (without sensitive data)
-        print(f"[WEBHOOK] Event: {event}, tx_ref: {tx_ref}, event_id: {flutterwave_event_id}")
-
-        # Validate required fields
         if not tx_ref:
             raise HTTPException(status_code=400, detail="Missing transaction reference")
 
-        if not flutterwave_event_id:
-            raise HTTPException(status_code=400, detail="Missing Flutterwave event ID")
-
-        # IDEMPOTENCY CHECK: Have we processed this webhook before?
-        existing_log = await session.execute(
-            select(WebhookLog).where(WebhookLog.flutterwave_event_id == flutterwave_event_id)
-        )
-        if existing_log.scalar_one_or_none():
-            print(f"[WEBHOOK] Duplicate event {flutterwave_event_id} - already processed")
-            return {"status": "already_processed", "message": "Webhook already handled"}
-
-        # Find the flyer record
         statement = select(FlyerRecord).where(FlyerRecord.tx_ref == tx_ref)
         result = await session.execute(statement)
         flyer = result.scalar_one_or_none()
@@ -589,121 +510,21 @@ async def flutterwave_webhook(
         if not flyer:
             raise HTTPException(status_code=404, detail=f"Record {tx_ref} not found")
 
-        # CRITICAL FIX: If already successful, don't reprocess (double protection)
-        if flyer.payment_status == "successful":
-            print(f"[WEBHOOK] Record {tx_ref} already marked successful - skipping")
-            return {"status": "already_successful", "message": "Payment already confirmed"}
-
-        # Handle different event types
-        if event == "charge.completed":
-            payment_status = data.get("status", "").lower()
-
-            if payment_status == "successful":
-                # CRITICAL FIX #2: Verify with Flutterwave API before giving value
-                try:
-                    verification_data = await verify_transaction_with_flutterwave(transaction_id)
-
-                    # Validate amount and currency match
-                    verified_amount = verification_data.get("amount")
-                    verified_currency = verification_data.get("currency")
-                    verified_status = verification_data.get("status", "").lower()
-                    verified_tx_ref = verification_data.get("tx_ref")
-
-                    # Security checks
-                    if verified_status != "successful":
-                        raise HTTPException(status_code=400, detail="Transaction not successful in Flutterwave")
-
-                    if verified_tx_ref != tx_ref:
-                        raise HTTPException(status_code=400, detail="Transaction reference mismatch")
-
-                    if verified_amount != flyer.amount:
-                        raise HTTPException(status_code=400, detail=f"Amount mismatch: expected {flyer.amount}, got {verified_amount}")
-
-                    if verified_currency != flyer.currency:
-                        raise HTTPException(status_code=400, detail=f"Currency mismatch: expected {flyer.currency}, got {verified_currency}")
-
-                    # All checks passed - update record
-                    flyer.payment_status = "successful"
-                    flyer.transaction_id = transaction_id
-                    flyer.updated_at = datetime.now(timezone.utc)
-
-                    # Log the webhook
-                    webhook_log = WebhookLog(
-                        flutterwave_event_id=flutterwave_event_id,
-                        event_type=event,
-                        tx_ref=tx_ref,
-                        transaction_id=transaction_id,
-                        status="successful",
-                        payload_summary=f"Amount: {verified_amount}, Currency: {verified_currency}"
-                    )
-                    session.add(webhook_log)
-                    await session.commit()
-
-                    print(f"[WEBHOOK] Payment verified and confirmed for {tx_ref}")
-                    return {"status": "success", "message": "Payment verified and confirmed", "tx_ref": tx_ref}
-
-                except HTTPException:
-                    raise
-                except Exception as e:
-                    await session.rollback()
-                    print(f"[WEBHOOK] Verification failed for {tx_ref}: {str(e)}")
-                    raise HTTPException(status_code=502, detail="Payment verification failed")
-
-            else:
-                # Payment completed but not successful (e.g., pending, failed)
-                flyer.payment_status = "failed"
-                flyer.transaction_id = transaction_id
-                flyer.updated_at = datetime.now(timezone.utc)
-
-                webhook_log = WebhookLog(
-                    flutterwave_event_id=flutterwave_event_id,
-                    event_type=event,
-                    tx_ref=tx_ref,
-                    transaction_id=transaction_id,
-                    status="failed",
-                    payload_summary=f"Payment status: {payment_status}"
-                )
-                session.add(webhook_log)
-                await session.commit()
-
-                return {"status": "processed", "message": f"Payment {payment_status}", "tx_ref": tx_ref}
-
-        # CRITICAL FIX #3: Handle charge.failed events
-        elif event == "charge.failed":
-            flyer.payment_status = "failed"
-            flyer.transaction_id = transaction_id
-            flyer.updated_at = datetime.now(timezone.utc)
-
-            webhook_log = WebhookLog(
-                flutterwave_event_id=flutterwave_event_id,
-                event_type=event,
-                tx_ref=tx_ref,
-                transaction_id=transaction_id,
-                status="failed",
-                payload_summary="Charge failed event received"
-            )
-            session.add(webhook_log)
+        if payment_status == "successful":
+            flyer.payment_status = "successful"
             await session.commit()
-
-            print(f"[WEBHOOK] Charge failed for {tx_ref}")
-            return {"status": "processed", "message": "Charge failed recorded", "tx_ref": tx_ref}
-
+            return {"status": "success", "message": "Payment confirmed", "tx_ref": tx_ref}
         else:
-            # Unknown event - acknowledge but don't process
-            return {"status": "ignored", "message": f"Event {event} not processed"}
+            flyer.payment_status = "failed"
+            await session.commit()
+            return {"status": "processed", "message": f"Payment {payment_status}", "tx_ref": tx_ref}
 
     except HTTPException:
         raise
     except Exception as e:
         await session.rollback()
-        # Don't expose internal error details
-        print(f"[WEBHOOK] Unexpected error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Webhook processing failed")
+        raise HTTPException(status_code=500, detail=f"Webhook failed: {str(e)}")
 
-
-# =============================================================================
-# OTHER ENDPOINTS (Updated with transaction_id)
-# =============================================================================
 
 @app.get(
     "/api/flyers/status/{tx_ref}",
@@ -714,6 +535,7 @@ async def check_status(
     tx_ref: str,
     session: AsyncSession = Depends(get_session)
 ):
+    """Check payment status by tx_ref."""
     statement = select(FlyerRecord).where(FlyerRecord.tx_ref == tx_ref)
     result = await session.execute(statement)
     flyer = result.scalar_one_or_none()
@@ -730,6 +552,10 @@ async def check_status(
     )
 
 
+# =============================================================================
+# ADMIN ENDPOINTS
+# =============================================================================
+
 @app.get(
     "/admin/dashboard",
     response_model=AdminDashboardResponse,
@@ -740,6 +566,7 @@ async def admin_dashboard(
     session: AsyncSession = Depends(get_session),
     auth: bool = Depends(verify_admin_credentials)
 ):
+    """Admin dashboard with complete student data. Protected by HTTP Basic Auth."""
     try:
         statement = select(FlyerRecord).order_by(FlyerRecord.created_at.desc())
         result = await session.execute(statement)
@@ -786,7 +613,6 @@ async def admin_dashboard(
                 whats_next=f.whats_next,
                 best_campus_experience=f.best_campus_experience,
                 tx_ref=f.tx_ref,
-                transaction_id=f.transaction_id,
                 payment_status=f.payment_status,
                 amount=f.amount,
                 created_at=f.created_at.isoformat()
@@ -822,6 +648,7 @@ async def admin_delete_flyer(
     session: AsyncSession = Depends(get_session),
     auth: bool = Depends(verify_admin_credentials)
 ):
+    """Admin: Delete a specific flyer record by tx_ref. Protected by HTTP Basic Auth."""
     try:
         statement = select(FlyerRecord).where(FlyerRecord.tx_ref == tx_ref)
         result = await session.execute(statement)
@@ -856,6 +683,7 @@ async def admin_delete_all_pending(
     session: AsyncSession = Depends(get_session),
     auth: bool = Depends(verify_admin_credentials)
 ):
+    """Admin: Delete ALL pending records. Protected by HTTP Basic Auth."""
     try:
         statement = select(FlyerRecord).where(FlyerRecord.payment_status == "pending")
         result = await session.execute(statement)
@@ -891,6 +719,11 @@ async def admin_upload_flyer(
     session: AsyncSession = Depends(get_session),
     auth: bool = Depends(verify_admin_credentials)
 ):
+    """Admin: Upload a finalized flyer record WITHOUT requiring payment.
+
+    This bypasses the payment flow entirely. The record is created with
+    payment_status='successful' and amount=0.0.
+    """
     try:
         tx_ref = generate_tx_ref()
 
@@ -918,9 +751,8 @@ async def admin_upload_flyer(
             whats_next=request.whats_next,
             best_campus_experience=request.best_campus_experience,
             tx_ref=tx_ref,
-            transaction_id=None,
-            payment_status="successful",
-            amount=0.0,
+            payment_status="successful",  # Bypass payment
+            amount=0.0,                   # No payment required
             created_at=datetime.now(timezone.utc)
         )
 
@@ -957,7 +789,6 @@ async def admin_upload_flyer(
                 whats_next=flyer.whats_next,
                 best_campus_experience=flyer.best_campus_experience,
                 tx_ref=flyer.tx_ref,
-                transaction_id=flyer.transaction_id,
                 payment_status=flyer.payment_status,
                 amount=flyer.amount,
                 created_at=flyer.created_at.isoformat()
@@ -991,14 +822,11 @@ async def health_check(session: AsyncSession = Depends(get_session)):
 async def root():
     return {
         "name": "NACOS Digital Flyer API",
-        "version": "3.1.0",
+        "version": "3.0.0",
         "features": [
             "Auto-delete pending records after 24h",
             "Admin bulk delete",
-            "Admin upload without payment",
-            "Flutterwave API verification",
-            "Webhook idempotency protection",
-            "Audit trail with WebhookLog"
+            "Admin upload without payment"
         ],
         "endpoints": {
             "initiate": "POST /api/flyers/initiate",
