@@ -482,50 +482,99 @@ async def flutterwave_webhook(
     session: AsyncSession = Depends(get_session)
 ):
     """Handle Flutterwave payment confirmation."""
-    # DEBUG LOGGING — check Render logs to verify
-    print(f"[WEBHOOK] Received verif-hash: '{verif_hash}'")
+    
+    # ─── DEBUG: Log everything ───
+    print(f"\n{'='*50}")
+    print(f"[WEBHOOK] Received at: {datetime.now(timezone.utc).isoformat()}")
+    print(f"[WEBHOOK] Full payload: {payload}")
+    print(f"[WEBHOOK] verif-hash header: '{verif_hash}'")
     print(f"[WEBHOOK] Expected hash: '{settings.FLW_WEBHOOK_HASH}'")
-    print(f"[WEBHOOK] Match: {secrets.compare_digest(verif_hash or '', settings.FLW_WEBHOOK_HASH)}")
-
+    
     if not verify_webhook_signature(verif_hash):
+        print(f"[WEBHOOK] SIGNATURE MISMATCH - Blocking request")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid webhook signature")
+    print(f"[WEBHOOK] Signature valid")
 
     try:
         event = payload.get("event", "")
         data = payload.get("data", {})
+        
+        print(f"[WEBHOOK] Event type: '{event}'")
+        print(f"[WEBHOOK] Data keys: {list(data.keys())}")
 
-        if event != "charge.completed":
+        # ─── FIX: Accept multiple event types ───
+        valid_events = ["charge.completed", "charge.successful", "payment.successful"]
+        if event not in valid_events:
+            print(f"[WEBHOOK] Ignoring event: {event}")
             return {"status": "ignored", "message": f"Event {event} not processed"}
 
         payment_status = data.get("status", "").lower()
+        print(f"[WEBHOOK] Payment status from payload: '{payment_status}'")
+
+        # ─── Extract tx_ref from multiple locations ───
         tx_ref = data.get("tx_ref")
+        source = "data.tx_ref"
+        
+        if not tx_ref:
+            meta = data.get("meta", {}) or {}
+            tx_ref = meta.get("transaction_id")
+            source = "meta.transaction_id"
+            print(f"[WEBHOOK] tx_ref from meta: {tx_ref}")
+        else:
+            print(f"[WEBHOOK] tx_ref from data: {tx_ref}")
 
         if not tx_ref:
+            print(f"[WEBHOOK] No tx_ref found anywhere in payload")
             raise HTTPException(status_code=400, detail="Missing transaction reference")
 
+        # ─── Check if record exists BEFORE updating ───
+        print(f"[WEBHOOK] Looking up tx_ref: '{tx_ref}'")
         statement = select(FlyerRecord).where(FlyerRecord.tx_ref == tx_ref)
         result = await session.execute(statement)
         flyer = result.scalar_one_or_none()
 
         if not flyer:
+            # Debug: Show all pending tx_refs
+            all_stmt = select(FlyerRecord.tx_ref, FlyerRecord.payment_status).where(
+                FlyerRecord.payment_status == "pending"
+            )
+            all_result = await session.execute(all_stmt)
+            pending_refs = all_result.all()
+            print(f"[WEBHOOK] Record '{tx_ref}' not found")
+            print(f"[WEBHOOK] Pending records in DB: {pending_refs}")
             raise HTTPException(status_code=404, detail=f"Record {tx_ref} not found")
 
-        if payment_status == "successful":
+        print(f"[WEBHOOK] Found record for: {flyer.full_name}, current status: {flyer.payment_status}")
+
+        # ─── FIX: Accept both "successful" and "completed" ───
+        success_statuses = ["successful", "completed"]
+        if payment_status in success_statuses:
             flyer.payment_status = "successful"
             await session.commit()
-            return {"status": "success", "message": "Payment confirmed", "tx_ref": tx_ref}
+            print(f"[WEBHOOK] Status updated to 'successful'")
+            return {
+                "status": "success", 
+                "message": "Payment confirmed", 
+                "tx_ref": tx_ref,
+                "source": source
+            }
         else:
             flyer.payment_status = "failed"
             await session.commit()
-            return {"status": "processed", "message": f"Payment {payment_status}", "tx_ref": tx_ref}
+            print(f"[WEBHOOK] Status updated to 'failed' (payment status was: {payment_status})")
+            return {
+                "status": "processed", 
+                "message": f"Payment {payment_status}", 
+                "tx_ref": tx_ref
+            }
 
     except HTTPException:
         raise
     except Exception as e:
         await session.rollback()
+        print(f"[WEBHOOK] ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Webhook failed: {str(e)}")
-
-
+              
 @app.get(
     "/api/flyers/status/{tx_ref}",
     response_model=FlyerStatusResponse,
